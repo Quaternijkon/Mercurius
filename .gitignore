@@ -21,3 +21,11 @@ faiss/python/swigfaiss_avx2.swig
 faiss/python/swigfaiss_avx512.swig
 faiss/python/swigfaiss_avx512_spr.swig
 faiss/python/swigfaiss_sve.swig
+sift/base.fbin
+sift/groundtruth.ivecs
+sift/learn.fbin
+sift/query.fbin
+sift/sift_base.fvecs
+sift/sift_groundtruth.ivecs
+sift/sift_learn.fvecs
+sift/sift_query.fvecs
