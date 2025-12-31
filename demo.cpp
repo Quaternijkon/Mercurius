@@ -30,17 +30,17 @@ struct Config {
     const char* gt_path = "sift/sift_groundtruth.ivecs";
 
     // 1. 索引构建
-    int nlist = 1024;           // IVF 聚类数
+    int nlist = 15625;           // IVF 聚类数
     int M = 32;                 // HNSW 连边数
-    int efConstruction = 16;    // HNSW 建图精度
+    int efConstruction = 40;    // HNSW 建图精度
 
     // 2. 数据划分
-    int n_neighbor_check = 16;
+    int n_neighbor_check = 24;
     float alpha = 1.1f;
 
     // 3. 搜索参数
     int k = 10;                // 用户最终需要的 Top-K
-    int efSearch = 40;         // HNSW 搜索广度 (同时也是第一阶段返回的候选点数量)
+    int efSearch = 80;         // HNSW 搜索广度 (同时也是第一阶段返回的候选点数量)
 };
 
 // ==========================================
@@ -84,6 +84,9 @@ int* read_ivecs(const char* fname, size_t* d_out, size_t* n_out) {
 //  Main
 // ==========================================
 int main() {
+    // Force Faiss to use OMP instead of BLAS for distance computations
+    faiss::distance_compute_blas_threshold = 2000000000;
+    omp_set_num_threads(40);
     Config cfg;
     double t0 = getmillisecs();
 
@@ -102,6 +105,8 @@ int main() {
     t0 = getmillisecs();
     IndexFlatL2 quantizer(d);
     IndexIVFFlat index_ivf(&quantizer, d, cfg.nlist, METRIC_L2);
+    // index_ivf.cp.niter = 10; // Reduce KMeans iterations to speed up training
+    // index_ivf.verbose = true; // Enable verbose to analyze training speed
     index_ivf.train(nt, xt);
     printf("Training done in %.3f ms\n", getmillisecs() - t0);
 
@@ -109,44 +114,85 @@ int main() {
     // 2. Partition (Tight vs Loose)
     // ---------------------------------------------------------
     t0 = getmillisecs();
+    double t_part_start = t0;
+    
     std::vector<float> dists(nb * cfg.n_neighbor_check);
     std::vector<idx_t> idxs(nb * cfg.n_neighbor_check);
-    quantizer.search(nb, xb, cfg.n_neighbor_check, dists.data(), idxs.data());
+    
+    const size_t batch_size = 65536; 
+    for (size_t i = 0; i < nb; i += batch_size) {
+        size_t current_batch_size = std::min(batch_size, nb - i);
+        quantizer.search(current_batch_size, xb + i * d, 
+                         cfg.n_neighbor_check, 
+                         dists.data() + i * cfg.n_neighbor_check, 
+                         idxs.data() + i * cfg.n_neighbor_check);
+    }
+    
+    double t_part_search = getmillisecs();
+    printf("Partitioning Step 1 (Quantizer Search): %.3f ms\n", t_part_search - t_part_start);
 
-    std::vector<idx_t> ivf_ids;      ivf_ids.reserve(nb);
-    std::vector<float> ivf_vecs;     ivf_vecs.reserve(nb * d);
-    std::vector<idx_t> ivf_assign;   ivf_assign.reserve(nb);
-    std::vector<idx_t> hnsw_ids;     hnsw_ids.reserve(nb / 10);
-    std::vector<float> hnsw_vecs;    hnsw_vecs.reserve(nb * d / 10);
-
+    // Parallel Partitioning Logic
+    std::vector<uint8_t> is_tight_vec(nb);
     float alpha_sq = cfg.alpha * cfg.alpha;
-    int cluster_count = 0, loose_count = 0;
 
+    #pragma omp parallel for
     for (size_t i = 0; i < nb; ++i) {
         float d1 = dists[i * cfg.n_neighbor_check + 0];
         float dn = dists[i * cfg.n_neighbor_check + (cfg.n_neighbor_check - 1)];
-        
-        bool is_tight = (d1 == 0) || (dn / d1 > alpha_sq);
-        const float* vec = xb + i * d;
+        is_tight_vec[i] = ((d1 == 0) || (dn / d1 > alpha_sq)) ? 1 : 0;
+    }
 
-        if (is_tight) {
-            ivf_ids.push_back(i);
-            ivf_assign.push_back(idxs[i * cfg.n_neighbor_check + 0]);
-            ivf_vecs.insert(ivf_vecs.end(), vec, vec + d);
-            cluster_count++;
+    // Serial Prefix Sum (Fast enough for 1M items)
+    std::vector<size_t> ivf_offsets(nb);
+    std::vector<size_t> hnsw_offsets(nb);
+    size_t cluster_count = 0;
+    size_t loose_count = 0;
+    
+    for (size_t i = 0; i < nb; ++i) {
+        ivf_offsets[i] = cluster_count;
+        hnsw_offsets[i] = loose_count;
+        if (is_tight_vec[i]) cluster_count++;
+        else loose_count++;
+    }
+
+    // Allocate Memory
+    std::vector<idx_t> ivf_ids(cluster_count);
+    std::vector<float> ivf_vecs(cluster_count * d);
+    std::vector<idx_t> ivf_assign(cluster_count);
+    
+    std::vector<idx_t> hnsw_ids(loose_count);
+    std::vector<float> hnsw_vecs(loose_count * d);
+
+    // Parallel Copy
+    #pragma omp parallel for
+    for (size_t i = 0; i < nb; ++i) {
+        const float* vec = xb + i * d;
+        if (is_tight_vec[i]) {
+            size_t idx = ivf_offsets[i];
+            ivf_ids[idx] = i;
+            ivf_assign[idx] = idxs[i * cfg.n_neighbor_check + 0];
+            memcpy(ivf_vecs.data() + idx * d, vec, d * sizeof(float));
         } else {
-            hnsw_ids.push_back(i);
-            hnsw_vecs.insert(hnsw_vecs.end(), vec, vec + d);
-            loose_count++;
+            size_t idx = hnsw_offsets[i];
+            hnsw_ids[idx] = i;
+            memcpy(hnsw_vecs.data() + idx * d, vec, d * sizeof(float));
         }
     }
-    printf("Partitioning: IVF=%d, HNSW=%d\n", cluster_count, loose_count);
+
+    double t_part_copy = getmillisecs();
+    printf("Partitioning Step 2 (Data Copy): %.3f ms\n", t_part_copy - t_part_search);
+    printf("Partitioning: IVF=%ld, HNSW=%ld\n", cluster_count, loose_count);
 
     // ---------------------------------------------------------
     // 3. Build Indices
     // ---------------------------------------------------------
+    double t_build_start = getmillisecs();
+    
     // Build IVF
     index_ivf.add_core(cluster_count, ivf_vecs.data(), ivf_ids.data(), ivf_assign.data());
+    
+    double t_build_ivf = getmillisecs();
+    printf("Build IVF done in %.3f ms\n", t_build_ivf - t_build_start);
 
     // Build HNSW (Loose + Centroids)
     std::vector<float> centroids(cfg.nlist * d);
@@ -164,12 +210,16 @@ int main() {
     IndexIDMap index_hnsw(&index_hnsw_storage);
     index_hnsw.add_with_ids(hnsw_ids.size(), hnsw_vecs.data(), hnsw_ids.data());
 
-    printf("Indices Built.\n");
+    double t_build_hnsw = getmillisecs();
+    printf("Build HNSW done in %.3f ms\n", t_build_hnsw - t_build_ivf);
+    printf("Indices Built Total: %.3f ms\n", t_build_hnsw - t_build_start);
 
     // ---------------------------------------------------------
     // 4. Hybrid Search (Simplified Logic)
     // ---------------------------------------------------------
+    printf("OMP Max Threads: %d\n", omp_get_max_threads());
     t0 = getmillisecs();
+    double t_start = t0;
 
     // 核心修改：直接让 efSearch 既控制搜索精度，也控制返回数量
     index_hnsw_storage.hnsw.efSearch = cfg.efSearch;
@@ -179,24 +229,38 @@ int main() {
     std::vector<float> hnsw_D(nq * k_hnsw_return);
     std::vector<idx_t> hnsw_I(nq * k_hnsw_return);
     index_hnsw.search(nq, xq, k_hnsw_return, hnsw_D.data(), hnsw_I.data());
+    
+    double t_hnsw = getmillisecs();
+    printf("Step 4.1 HNSW Search: %.3f ms\n", t_hnsw - t_start);
 
     // Step 4.2: Analyze HNSW results to find Centroids
     std::vector<std::vector<idx_t>> query_clusters(nq);
     size_t max_clusters = 0;
 
+    long long total_centroids = 0;
+    long long total_loose = 0;
+
     for (size_t i = 0; i < nq; ++i) {
         std::set<idx_t> clusters;
         for (int j = 0; j < k_hnsw_return; ++j) {
             idx_t id = hnsw_I[i * k_hnsw_return + j];
-            if (id != -1 && (id & centroid_mask)) {
-                // Found a centroid! Add this cluster to IVF search target
-                clusters.insert(id & ~centroid_mask);
+            if (id != -1) {
+                if (id & centroid_mask) {
+                    // Found a centroid! Add this cluster to IVF search target
+                    clusters.insert(id & ~centroid_mask);
+                    total_centroids++;
+                } else {
+                    total_loose++;
+                }
             }
         }
         query_clusters[i].assign(clusters.begin(), clusters.end());
         if (clusters.size() > max_clusters) max_clusters = clusters.size();
     }
     if (max_clusters == 0) max_clusters = 1;
+    
+    double t_analyze = getmillisecs();
+    printf("Step 4.2 Analysis: %.3f ms (Max Clusters: %ld)\n", t_analyze - t_hnsw, max_clusters);
 
     // Step 4.3: IVF Search on identified clusters
     std::vector<idx_t> ivf_assign_query(nq * max_clusters, -1);
@@ -211,13 +275,22 @@ int main() {
     IVFSearchParameters ivf_params;
     ivf_params.nprobe = max_clusters; 
     
-    // 注意：search_preassigned 会在指定的 cluster 里搜，
-    // 虽然不会把“所有点”都读出来（那样内存太大了），但会扫描所有点并返回 Top-K。
-    // 这里我们请求返回 cfg.k 个结果，用于最后的合并
     std::vector<float> ivf_D(nq * cfg.k);
     std::vector<idx_t> ivf_I(nq * cfg.k);
-    index_ivf.search_preassigned(nq, xq, cfg.k, ivf_assign_query.data(), ivf_centroid_dis.data(), 
-                                 ivf_D.data(), ivf_I.data(), false, &ivf_params);
+
+    // Manual Parallelization of IVF Search
+    #pragma omp parallel for
+    for (size_t i = 0; i < nq; ++i) {
+        index_ivf.search_preassigned(1, xq + i * d, cfg.k, 
+                                     ivf_assign_query.data() + i * max_clusters, 
+                                     ivf_centroid_dis.data() + i * max_clusters, 
+                                     ivf_D.data() + i * cfg.k, 
+                                     ivf_I.data() + i * cfg.k, 
+                                     false, &ivf_params);
+    }
+                                 
+    double t_ivf = getmillisecs();
+    printf("Step 4.3 IVF Search: %.3f ms\n", t_ivf - t_analyze);
 
     // Step 4.4: Merge & Top-K
     std::vector<idx_t> final_I(nq * cfg.k);
@@ -265,7 +338,12 @@ int main() {
             filled++;
         }
     }
-    printf("Search done in %.3f ms\n", getmillisecs() - t0);
+    double t_merge = getmillisecs();
+    printf("Step 4.4 Merge: %.3f ms\n", t_merge - t_ivf);
+    
+    printf("Search done in %.3f ms\n", t_merge - t_start);
+    printf("HNSW Result Stats (Avg): Centroids=%.2f, Loose Points=%.2f\n", 
+        (double)total_centroids / nq, (double)total_loose / nq);
 
     // ---------------------------------------------------------
     // 5. Recall Check
