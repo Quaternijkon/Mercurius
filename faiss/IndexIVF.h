@@ -85,6 +85,12 @@ struct InvertedListScanner;
 struct IndexIVFStats;
 struct CodePacker;
 
+struct QueryLatencyStats {
+    double quantization_us;
+    double list_scan_us;
+    double total_us;
+};
+
 struct IndexIVFInterface : Level1Quantizer {
     size_t nprobe = 1;    ///< number of probes at query time
     size_t max_codes = 0; ///< max nb of codes to visit to do a query
@@ -317,6 +323,28 @@ struct IndexIVF : Index, IndexIVFInterface {
             float* distances,
             idx_t* labels,
             const SearchParameters* params = nullptr) const override;
+
+    void search_stats(
+            idx_t n,
+            const float* x,
+            idx_t k,
+            float* distances,
+            idx_t* labels,
+            const SearchParameters* params_in,
+            QueryLatencyStats* per_query_stats) const;
+
+    void search_preassigned_stats(
+            idx_t n,
+            const float* x,
+            idx_t k,
+            const idx_t* keys,
+            const float* coarse_dis,
+            float* distances,
+            idx_t* labels,
+            bool store_pairs,
+            const IVFSearchParameters* params,
+            IndexIVFStats* ivf_stats,
+            QueryLatencyStats* per_query_stats) const;
 
     void range_search(
             idx_t n,

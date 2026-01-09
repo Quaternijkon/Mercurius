@@ -17,9 +17,12 @@ TARGET3 = demo3-nprobe
 TARGET4 = demo4-hnsw
 TARGET5 = demo4-hnsw-exclude
 TARGET6 = demo4-hnsw-reference
+TARGET7 = demo5-flat
+TARGET8 = demo6-latency
+TARGET9 = demo7-hierarchy
 
 # 默认目标: 同时编译所有可执行文件
-all: $(TARGET1) $(TARGET2) $(TARGET3) $(TARGET4) $(TARGET5) $(TARGET6)
+all: $(TARGET1) $(TARGET2) $(TARGET3) $(TARGET4) $(TARGET5) $(TARGET6) $(TARGET7) $(TARGET8) $(TARGET9)
 
 # ==========================================
 # 通用编译规则
@@ -53,13 +56,22 @@ run-demo5: $(TARGET5)
 run-demo6: $(TARGET6)
 	./$(TARGET6)
 
+run-demo7: $(TARGET7)
+	./$(TARGET7)
+
+run-demo8: $(TARGET8)
+	./$(TARGET8)
+
+run-demo9: $(TARGET9)
+	./$(TARGET9)
+
 # 默认运行最新的 demo3
-run: run-demo6
+run: run-demo9
 
 # ==========================================
 # 清理规则
 # ==========================================
 clean:
-	rm -f $(TARGET1) $(TARGET2) $(TARGET3) $(TARGET4) $(TARGET5) $(TARGET6)
+	rm -f $(TARGET1) $(TARGET2) $(TARGET3) $(TARGET4) $(TARGET5) $(TARGET6) $(TARGET7) $(TARGET8) $(TARGET9)
 
-.PHONY: all run run-demo run-demo2 run-demo3 run-demo4 run-demo5 run-demo6 clean
+.PHONY: all run run-demo run-demo2 run-demo3 run-demo4 run-demo5 run-demo6 run-demo7 clean
