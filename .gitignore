@@ -24,3 +24,4 @@ faiss/python/swigfaiss_sve.swig
 sift/
 moved/
 indices/
+ivf_entries.index
