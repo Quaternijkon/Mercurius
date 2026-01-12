@@ -41,35 +41,56 @@ void ensure_dir(const std::string& path) {
     }
 }
 
-pair<size_t, size_t> get_fbin_meta(const string& filename) {
+// Replaced get_fbin_meta with get_fvecs_meta
+pair<size_t, size_t> get_fvecs_meta(const string& filename) {
     ifstream f(filename, ios::binary);
     if (!f.is_open()) throw runtime_error("Cannot open file: " + filename);
-    int32_t nvecs_raw, dim_raw;
-    f.read(reinterpret_cast<char*>(&nvecs_raw), sizeof(int32_t));
-    f.read(reinterpret_cast<char*>(&dim_raw), sizeof(int32_t));
-    return {static_cast<size_t>(nvecs_raw), static_cast<size_t>(dim_raw)};
+    int32_t d;
+    f.read(reinterpret_cast<char*>(&d), sizeof(int32_t));
+    f.seekg(0, ios::end);
+    size_t sz = f.tellg();
+    size_t n = sz / (sizeof(int32_t) + d * sizeof(float));
+    return {n, (size_t)d};
 }
 
-pair<vector<float>, pair<size_t, size_t>> read_fbin(const string& filename, size_t start_idx = 0, size_t chunk_size = 0) {
+// Replaced read_fbin with read_fvecs
+pair<vector<float>, pair<size_t, size_t>> read_fvecs(const string& filename, size_t start_idx = 0, size_t chunk_size = 0) {
     ifstream f(filename, ios::binary);
     if (!f.is_open()) throw runtime_error("Cannot open file: " + filename);
-    int32_t nvecs_raw, dim_raw;
-    f.read(reinterpret_cast<char*>(&nvecs_raw), sizeof(int32_t));
-    f.read(reinterpret_cast<char*>(&dim_raw), sizeof(int32_t));
-    size_t nvecs = static_cast<size_t>(nvecs_raw);
-    size_t dim = static_cast<size_t>(dim_raw);
-
-    size_t num_vectors_in_chunk = nvecs;
+    
+    int32_t d;
+    f.read(reinterpret_cast<char*>(&d), sizeof(int32_t));
+    size_t row_sz = sizeof(int32_t) + d * sizeof(float);
+    
+    f.seekg(0, ios::end);
+    size_t sz = f.tellg();
+    size_t n = sz / row_sz;
+    
+    size_t n_read = n;
     if (chunk_size > 0) {
-        size_t end_idx = min(start_idx + chunk_size, nvecs);
-        num_vectors_in_chunk = end_idx - start_idx;
-        if (num_vectors_in_chunk == 0) return {{}, {0, dim}};
-        size_t offset = 8 + start_idx * dim * sizeof(float);
-        f.seekg(offset, ios::beg);
+        size_t end = min(n, start_idx + chunk_size);
+        n_read = (end > start_idx) ? (end - start_idx) : 0;
+        f.seekg(start_idx * row_sz, ios::beg);
+    } else { 
+        if (start_idx > 0) {
+            n_read = (n > start_idx) ? (n - start_idx) : 0;
+            f.seekg(start_idx * row_sz, ios::beg);
+        } else {
+            f.seekg(0, ios::beg);
+        }
     }
-    vector<float> data(num_vectors_in_chunk * dim);
-    f.read(reinterpret_cast<char*>(data.data()), num_vectors_in_chunk * dim * sizeof(float));
-    return {data, {num_vectors_in_chunk, dim}};
+    
+    if (n_read == 0) return {{}, {0, (size_t)d}};
+
+    vector<float> data(n_read * d);
+    vector<char> raw(n_read * row_sz);
+    f.read(raw.data(), n_read * row_sz);
+    
+    for(size_t i=0; i<n_read; ++i) {
+        memcpy(&data[i*d], raw.data() + i*row_sz + sizeof(int32_t), d*sizeof(float));
+    }
+    
+    return {data, {n_read, (size_t)d}};
 }
 
 vector<vector<int32_t>> read_ivecs(const string& filename) {
@@ -90,9 +111,9 @@ vector<vector<int32_t>> read_ivecs(const string& filename) {
 
 // Config
 const string DATA_DIR = "./sift";
-const string LEARN_FILE = DATA_DIR + "/learn.fbin";
-const string BASE_FILE = DATA_DIR + "/base.fbin";
-const string QUERY_FILE = DATA_DIR + "/query.fbin";
+const string LEARN_FILE = DATA_DIR + "/learn.fvecs"; 
+const string BASE_FILE = DATA_DIR + "/base.fvecs";  
+const string QUERY_FILE = DATA_DIR + "/query.fvecs";
 const string GROUNDTRUTH_FILE = DATA_DIR + "/groundtruth.ivecs";
 const string INDEX_DIR = "indices";
 const string IVF_INDEX_FILE = INDEX_DIR + "/ivf_ondisk_demo7.index";
@@ -114,7 +135,7 @@ int main() {
     omp_set_num_threads(8);
     ensure_dir(INDEX_DIR);
 
-    auto [nb, d] = get_fbin_meta(BASE_FILE);
+    auto [nb, d] = get_fvecs_meta(BASE_FILE); 
     cout << "Dataset Info: nb=" << nb << ", d=" << d << endl; 
 
     IndexIVFFlat* index_ivf = nullptr;
@@ -125,7 +146,7 @@ int main() {
     // 1. Training
     {
         cout << "Loading Learn data..." << endl;
-        auto [xt_vec, meta_learn] = read_fbin(LEARN_FILE);
+        auto [xt_vec, meta_learn] = read_fvecs(LEARN_FILE); 
         size_t nt = meta_learn.first;
         float* xt = xt_vec.data();
 
@@ -174,7 +195,7 @@ int main() {
     hnsw_impl->hnsw.efSearch = EF_CONSTRUCTION;
 
     for (size_t start_idx = 0; start_idx < nb; start_idx += chunk_size) {
-        auto [chunk_data, meta_chunk] = read_fbin(BASE_FILE, start_idx, chunk_size);
+        auto [chunk_data, meta_chunk] = read_fvecs(BASE_FILE, start_idx, chunk_size); 
         size_t current_chunk_size = meta_chunk.first;
         float* xb_chunk = chunk_data.data();
         
@@ -250,7 +271,7 @@ int main() {
 
     // 6. Unified Search (Hybrid: RAM HNSW + Disk IVF)
     cout << "Starting Unified Search..." << endl;
-    auto [xq_vec, meta_query] = read_fbin(QUERY_FILE);
+    auto [xq_vec, meta_query] = read_fvecs(QUERY_FILE); 
     size_t nq = meta_query.first;
     float* xq = xq_vec.data();
 
